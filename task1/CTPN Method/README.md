@@ -1,6 +1,32 @@
 # Connectionist Text Proposal Network
 
-This is a tensorflow implementation of [CTPN](https://arxiv.org/abs/1609.03605) by @tianzhi0549 and @varun-suresh. Many thanks to their great work and pre-trained models, and the original repository can be found [here](https://github.com/tianzhi0549/CTPN.git). More detail of set-up and training process can be found in their [documentation](https://github.com/tianzhi0549/CTPN/blob/master/README.md). Here we document how we used this work to solve task 1.
+This project originally started from a TensorFlow implementation of [CTPN](https://arxiv.org/abs/1609.03605) by @tianzhi0549 and @varun-suresh.
+
+## Python 3.10 / PyTorch Version
+
+In this repository, `main/train.py` and `main/demo.py` are now PyTorch scripts that run on Python 3.10.
+
+### Quick Start
+
+1. Install dependencies:
+```shell
+pip install -r requirements.txt
+```
+2. Prepare training data from the repo dataset:
+```shell
+cd data/dataset
+python import_from_repo.py
+python prepare_dataset.py
+```
+3. Train (example):
+```shell
+cd ../..
+python main/train.py --epochs 10 --batch-size 4
+```
+4. Inference (example):
+```shell
+python main/demo.py --checkpoint checkpoints_mlt/ctpn_epoch_010.pth --test-data-path data/demo --output-path data/res
+```
 
 ## Introduction
 

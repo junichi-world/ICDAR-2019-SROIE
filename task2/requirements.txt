@@ -1,0 +1,12 @@
+# Task 2 (CRNN OCR) dependencies for Python 3.10
+torch>=2.5,<2.7
+torchvision>=0.20,<0.22
+numpy>=1.24,<3
+pillow>=9,<12
+opencv-python>=4.8,<5
+lmdb>=1.4
+six>=1.16
+
+# Optional: legacy CTC loss implementation used in original repo.
+# If unavailable, train.py falls back to torch.nn.CTCLoss.
+# warpctc-pytorch

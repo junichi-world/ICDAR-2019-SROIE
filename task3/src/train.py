@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 
 import torch
 from torch import nn, optim
@@ -20,14 +21,20 @@ def main():
 
     args = parser.parse_args()
     args.device = torch.device(args.device)
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    data_dir = os.path.join(project_root, "data")
+    results_dir = os.path.join(project_root, "results")
+    model_path = os.path.join(project_root, "model.pth")
+
+    os.makedirs(results_dir, exist_ok=True)
 
     model = MyModel0(len(VOCAB), 16, args.hidden_size).to(args.device)
 
     dataset = MyDataset(
-        "data/data_dict4.pth",
+        os.path.join(data_dir, "data_dict4.pth"),
         args.device,
         val_size=args.val_size,
-        test_path="data/test_dict.pth",
+        test_path=os.path.join(data_dir, "test_dict.pth"),
     )
 
     criterion = nn.CrossEntropyLoss(
@@ -49,7 +56,7 @@ def main():
 
     # validate(model, dataset, batch_size=10)
 
-    torch.save(model.state_dict(), "model.pth")
+    torch.save(model.state_dict(), model_path)
 
     model.eval()
     with torch.no_grad():
@@ -66,7 +73,8 @@ def main():
             real_text = dataset.test_dict[key]
             result = pred_to_dict(real_text, pred, prob)
 
-            with open("results/" + key + ".json", "w", encoding="utf-8") as json_opened:
+            out_path = os.path.join(results_dir, key + ".json")
+            with open(out_path, "w", encoding="utf-8") as json_opened:
                 json.dump(result, json_opened, indent=4)
 
             print(key)

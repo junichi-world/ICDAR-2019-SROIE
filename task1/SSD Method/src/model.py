@@ -6,6 +6,7 @@ from math import sqrt
 from itertools import product as product
 import torchvision
 import torch
+import os
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
@@ -109,12 +110,29 @@ class VGGBase(nn.Module):
         However, the original VGG-16 does not contain the conv6 and con7 layers.
         Therefore, we convert fc6 and fc7 into convolutional layers, and subsample by decimation. See 'decimate' in utils.py.
         """
+        if os.environ.get("SSD_NO_PRETRAINED_BASE", "0") == "1":
+            print("\nSkipping pretrained VGG16 load (SSD_NO_PRETRAINED_BASE=1).\n")
+            return
+
         # Current state of base
         state_dict = self.state_dict()
         param_names = list(state_dict.keys())
 
         # Pretrained VGG base
-        pretrained_state_dict = torchvision.models.vgg16(pretrained=True).state_dict()
+        try:
+            # torchvision>=0.13
+            weights = getattr(torchvision.models, "VGG16_Weights", None)
+            if weights is not None:
+                pretrained_state_dict = torchvision.models.vgg16(
+                    weights=weights.IMAGENET1K_V1
+                ).state_dict()
+            else:
+                # legacy torchvision
+                pretrained_state_dict = torchvision.models.vgg16(pretrained=True).state_dict()
+        except Exception as e:
+            print(f"\nWarning: failed to load pretrained VGG16 weights ({e}).")
+            print("Training will continue with randomly initialized base layers.\n")
+            return
         pretrained_param_names = list(pretrained_state_dict.keys())
 
         # Transfer conv. parameters from pretrained model to current model

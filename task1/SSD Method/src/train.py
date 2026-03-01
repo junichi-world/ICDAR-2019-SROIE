@@ -3,6 +3,7 @@ os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # to specify the GPU_id in the remote server
 
 import time
+import argparse
 import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
@@ -11,38 +12,83 @@ from datasets import ICDARDataset
 from utils import *
 
 
+# Paths relative to this script so the command works from any CWD.
+THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", "..", ".."))
+
 # Data parameters
-data_folder = '../ICDAR_Dataset/0325updated.task1train(626p)/'  # folder with data files
+data_folder = os.path.join(REPO_ROOT, 'dataset', '0325updated.task1train(626p)')  # folder with data files
 keep_difficult = False  # use objects considered difficult to detect?
 
 # Model parameters
 # Not too many here since the SSD300 has a very specific structure
 n_classes = len(label_map)  # number of different types of objects
-#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Learning parameters
-checkpoint = "checkpoint_ssd300.pth.tar" #'BEST_checkpoint_ssd300.pth.tar' #"checkpoint_ssd300.pth.tar"  # path to model checkpoint, None if none
+checkpoint = None  # path to model checkpoint, None if none
 batch_size = 12  # batch size
 start_epoch = 0  # start at this epoch
 epochs = 300  # number of epochs to run without early-stopping
 epochs_since_improvement = 0  # number of epochs since there was an improvement in the validation metric
 best_loss = 100.  # assume a high loss at first
-workers = 4  # number of workers for loading data in the DataLoader
+workers = 0  # number of workers for loading data in the DataLoader
 print_freq = 10  # print training or validation status every __ batches
 lr = 1e-3  # learning rate
 momentum = 0.9  # momentum
 weight_decay = 5e-4  # weight decay
 grad_clip = None  # clip if gradients are exploding, which may happen at larger batch sizes (sometimes at 32) - you will recognize it by a sorting error in the MuliBox loss calculation
 
-cudnn.benchmark = True
+cudnn.benchmark = torch.cuda.is_available()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-folder", default=data_folder)
+    parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--batch-size", type=int, default=batch_size)
+    parser.add_argument("--epochs", type=int, default=epochs)
+    parser.add_argument("--workers", type=int, default=workers)
+    parser.add_argument("--print-freq", type=int, default=print_freq)
+    parser.add_argument("--lr", type=float, default=lr)
+    parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--no-pretrained-base", action="store_true")
+    return parser.parse_args()
 
 
 def main():
     """
     Training and validation.
     """
-    global epochs_since_improvement, start_epoch, label_map, best_loss, epoch, checkpoint
+    global epochs_since_improvement, start_epoch, label_map, best_loss, epoch
+    global checkpoint, batch_size, epochs, workers, print_freq, lr, device, data_folder
+
+    args = parse_args()
+    data_folder = os.path.abspath(args.data_folder)
+    checkpoint = args.checkpoint if args.checkpoint.strip() else None
+    batch_size = args.batch_size
+    epochs = args.epochs
+    workers = args.workers
+    print_freq = args.print_freq
+    lr = args.lr
+    if args.cpu:
+        device = torch.device("cpu")
+    if args.no_pretrained_base:
+        os.environ["SSD_NO_PRETRAINED_BASE"] = "1"
+
+    required_json = [
+        "TRAIN_images.json",
+        "TRAIN_objects.json",
+        "TEST_images.json",
+        "TEST_objects.json",
+        "label_map.json",
+    ]
+    missing = [f for f in required_json if not os.path.exists(os.path.join(data_folder, f))]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing SSD data files in {data_folder}: {missing}. "
+            f"Run prepare_data.py first."
+        )
 
     # Initialize model or load checkpoint
     if checkpoint is None:
@@ -61,7 +107,10 @@ def main():
                                     lr=lr, momentum=momentum, weight_decay=weight_decay)
 
     else:
-        checkpoint = torch.load(checkpoint)
+        try:
+            checkpoint = torch.load(checkpoint, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(checkpoint, map_location=device)
         start_epoch = checkpoint['epoch'] + 1
         epochs_since_improvement = checkpoint['epochs_since_improvement']
         best_loss = checkpoint['best_loss'] + 1

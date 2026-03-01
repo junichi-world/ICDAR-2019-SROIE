@@ -1,117 +1,323 @@
-import datetime
+import argparse
+import math
 import os
-import sys
-import time
+from dataclasses import dataclass
+from typing import List, Tuple
 
-import tensorflow as tf
-
-sys.path.append(os.getcwd())
-from tensorflow.contrib import slim
-from nets import model_train as model
-from utils.dataset import data_provider as data_provider
-
-tf.app.flags.DEFINE_float('learning_rate', 1e-5, '')
-tf.app.flags.DEFINE_integer('max_steps', 50000, '')
-tf.app.flags.DEFINE_integer('decay_steps', 30000, '')
-tf.app.flags.DEFINE_float('decay_rate', 0.1, '')
-tf.app.flags.DEFINE_float('moving_average_decay', 0.997, '')
-tf.app.flags.DEFINE_integer('num_readers', 4, '')
-tf.app.flags.DEFINE_string('gpu', '0', '')
-tf.app.flags.DEFINE_string('checkpoint_path', 'checkpoints_mlt/', '')
-tf.app.flags.DEFINE_string('logs_path', 'logs_mlt/', '')
-tf.app.flags.DEFINE_string('pretrained_model_path', 'data/vgg_16.ckpt', '')
-tf.app.flags.DEFINE_boolean('restore', False, '')
-tf.app.flags.DEFINE_integer('save_checkpoint_steps', 2000, '')
-FLAGS = tf.app.flags.FLAGS
+from PIL import Image
+import torch
+from torch import nn, optim
+from torch.optim import lr_scheduler
+from torch.utils.data import DataLoader, Dataset, random_split
+from torchvision import transforms
+import torchvision
 
 
-def main(argv=None):
-    os.environ['CUDA_VISIBLE_DEVICES'] = FLAGS.gpu
-    now = datetime.datetime.now()
-    StyleTime = now.strftime("%Y-%m-%d-%H-%M-%S")
-    os.makedirs(FLAGS.logs_path + StyleTime)
-    if not os.path.exists(FLAGS.checkpoint_path):
-        os.makedirs(FLAGS.checkpoint_path)
-
-    input_image = tf.placeholder(tf.float32, shape=[None, None, None, 3], name='input_image')
-    input_bbox = tf.placeholder(tf.float32, shape=[None, 5], name='input_bbox')
-    input_im_info = tf.placeholder(tf.float32, shape=[None, 3], name='input_im_info')
-
-    global_step = tf.get_variable('global_step', [], initializer=tf.constant_initializer(0), trainable=False)
-    learning_rate = tf.Variable(FLAGS.learning_rate, trainable=False)
-    tf.summary.scalar('learning_rate', learning_rate)
-    opt = tf.train.AdamOptimizer(learning_rate)
-
-    gpu_id = int(FLAGS.gpu)
-    with tf.device('/gpu:%d' % gpu_id):
-        with tf.name_scope('model_%d' % gpu_id) as scope:
-            bbox_pred, cls_pred, cls_prob = model.model(input_image)
-            total_loss, model_loss, rpn_cross_entropy, rpn_loss_box = model.loss(bbox_pred, cls_pred, input_bbox,
-                                                                                 input_im_info)
-            batch_norm_updates_op = tf.group(*tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope))
-            grads = opt.compute_gradients(total_loss)
-
-    apply_gradient_op = opt.apply_gradients(grads, global_step=global_step)
-
-    summary_op = tf.summary.merge_all()
-    variable_averages = tf.train.ExponentialMovingAverage(
-        FLAGS.moving_average_decay, global_step)
-    variables_averages_op = variable_averages.apply(tf.trainable_variables())
-    with tf.control_dependencies([variables_averages_op, apply_gradient_op, batch_norm_updates_op]):
-        train_op = tf.no_op(name='train_op')
-
-    saver = tf.train.Saver(tf.global_variables(), max_to_keep=100)
-    summary_writer = tf.summary.FileWriter(FLAGS.logs_path + StyleTime, tf.get_default_graph())
-
-    init = tf.global_variables_initializer()
-
-    if FLAGS.pretrained_model_path is not None:
-        variable_restore_op = slim.assign_from_checkpoint_fn(FLAGS.pretrained_model_path,
-                                                             slim.get_trainable_variables(),
-                                                             ignore_missing_vars=True)
-
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    config.gpu_options.per_process_gpu_memory_fraction = 0.95
-    config.allow_soft_placement = True
-    with tf.Session(config=config) as sess:
-        if FLAGS.restore:
-            ckpt = tf.train.latest_checkpoint(FLAGS.checkpoint_path)
-            restore_step = int(ckpt.split('.')[0].split('_')[-1])
-            print("continue training from previous checkpoint {}".format(restore_step))
-            saver.restore(sess, ckpt)
-        else:
-            sess.run(init)
-            restore_step = 0
-            if FLAGS.pretrained_model_path is not None:
-                variable_restore_op(sess)
-
-        data_generator = data_provider.get_batch(num_workers=FLAGS.num_readers)
-        start = time.time()
-        for step in range(restore_step, FLAGS.max_steps):
-            data = next(data_generator)
-            ml, tl, _, summary_str = sess.run([model_loss, total_loss, train_op, summary_op],
-                                              feed_dict={input_image: data[0],
-                                                         input_bbox: data[1],
-                                                         input_im_info: data[2]})
-
-            summary_writer.add_summary(summary_str, global_step=step)
-
-            if step != 0 and step % FLAGS.decay_steps == 0:
-                sess.run(tf.assign(learning_rate, learning_rate.eval() * FLAGS.decay_rate))
-
-            if step % 10 == 0:
-                avg_time_per_step = (time.time() - start) / 10
-                start = time.time()
-                print('Step {:06d}, model loss {:.4f}, total loss {:.4f}, {:.2f} seconds/step, LR: {:.6f}'.format(
-                    step, ml, tl, avg_time_per_step, learning_rate.eval()))
-
-            if (step + 1) % FLAGS.save_checkpoint_steps == 0:
-                filename = ('ctpn_{:d}'.format(step + 1) + '.ckpt')
-                filename = os.path.join(FLAGS.checkpoint_path, filename)
-                saver.save(sess, filename)
-                print('Write model to: {:s}'.format(filename))
+STRIDE = 16
 
 
-if __name__ == '__main__':
-    tf.app.run()
+@dataclass
+class SamplePaths:
+    image: str
+    label: str
+
+
+class CtpnDataset(Dataset):
+    def __init__(
+        self,
+        data_dir: str,
+        n_anchor: int = 10,
+        resolution: Tuple[int, int] = (448, 224),
+        transform=None,
+    ):
+        super().__init__()
+        self.data_dir = os.path.abspath(data_dir)
+        self.image_dir = os.path.join(self.data_dir, "image")
+        self.label_dir = os.path.join(self.data_dir, "label")
+        self.resolution = tuple(resolution)
+        self.grid_h = self.resolution[0] // STRIDE
+        self.grid_w = self.resolution[1] // STRIDE
+        self.n_anchor = n_anchor
+        self.anchors = torch.tensor([5 * (2 ** (i / 2)) for i in range(n_anchor)])
+        self.transform = transform or transforms.Compose([transforms.ToTensor()])
+
+        if not os.path.isdir(self.image_dir) or not os.path.isdir(self.label_dir):
+            raise FileNotFoundError(
+                f"Expected dataset folders: {self.image_dir} and {self.label_dir}"
+            )
+
+        image_files = sorted(
+            [f for f in os.listdir(self.image_dir) if f.lower().endswith((".jpg", ".png", ".jpeg"))]
+        )
+        self.samples: List[SamplePaths] = []
+        for image_name in image_files:
+            stem = os.path.splitext(image_name)[0]
+            label_path = os.path.join(self.label_dir, stem + ".txt")
+            if os.path.exists(label_path):
+                self.samples.append(
+                    SamplePaths(
+                        image=os.path.join(self.image_dir, image_name),
+                        label=label_path,
+                    )
+                )
+
+        if not self.samples:
+            raise RuntimeError(f"No matched image/label samples in {self.data_dir}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        img = Image.open(sample.image).convert("RGB")
+
+        h_scaling = self.resolution[0] / img.height
+        w_scaling = self.resolution[1] / img.width
+        img = transforms.functional.resize(img, self.resolution)
+        img = self.transform(img)
+
+        tgt_cls = torch.zeros(self.grid_h, self.grid_w, self.n_anchor, dtype=torch.long)
+        tgt_v = torch.zeros(self.grid_h, self.grid_w, self.n_anchor, 2)
+        idx_v = torch.zeros_like(tgt_v, dtype=torch.bool)
+        tgt_o = torch.zeros(self.grid_h, self.grid_w, self.n_anchor)
+        idx_o = torch.zeros_like(tgt_o, dtype=torch.bool)
+
+        with open(sample.label, "r", encoding="utf-8", errors="ignore") as fo:
+            for line in fo:
+                parts = line.strip().split(",")
+                if len(parts) < 4:
+                    continue
+                try:
+                    x0, y0, x1, y1 = [float(v) for v in parts[:4]]
+                except ValueError:
+                    continue
+
+                x0 *= w_scaling
+                x1 *= w_scaling
+                y0 *= h_scaling
+                y1 *= h_scaling
+
+                if x1 <= x0 or y1 <= y0:
+                    continue
+
+                cy_box = (y0 + y1) / 2
+                h_box = max(y1 - y0, 1.0)
+
+                row = int(cy_box // STRIDE)
+                row = max(0, min(self.grid_h - 1, row))
+
+                col_start = int(max(0, min(self.grid_w - 1, x0 // STRIDE)))
+                col_end = int(max(0, min(self.grid_w, math.ceil(x1 / STRIDE))))
+                if col_end <= col_start:
+                    col_end = min(self.grid_w, col_start + 1)
+
+                anc = (self.anchors - h_box).abs().argmin().item()
+                tgt_cls[row, col_start:col_end, anc] = 1
+
+                cy_anc = row * STRIDE + STRIDE / 2
+                h_anc = float(self.anchors[anc].item())
+                v_c = (cy_box - cy_anc) / h_anc
+                v_h = math.log(h_box / h_anc)
+                tgt_v[row, col_start:col_end, anc, 0] = v_c
+                tgt_v[row, col_start:col_end, anc, 1] = v_h
+                idx_v[row, col_start:col_end, anc, :] = True
+
+                for x_side in [x0, x1]:
+                    start = int(round(max((x_side - 32) / STRIDE, 0)))
+                    end = int(round(min((x_side + 32) / STRIDE, self.grid_w)))
+                    if end <= start:
+                        end = min(self.grid_w, start + 1)
+                    cols = torch.arange(start, end)
+                    cx_anc = cols * STRIDE + STRIDE / 2
+                    o = (x_side - cx_anc) / STRIDE
+                    tgt_o[row, cols, anc] = o
+                    idx_o[row, cols, anc] = True
+
+        return img, tgt_cls, tgt_v, idx_v, tgt_o, idx_o
+
+
+class CtpnModel(nn.Module):
+    def __init__(self, n_anchor=10, pretrained_backbone=True):
+        super().__init__()
+        self.n_anchor = n_anchor
+        self.features = self._build_backbone(pretrained_backbone)
+        self.slider = nn.Conv2d(512, 512, 3, padding=1)
+        self.bilstm = nn.LSTM(512, 128, bidirectional=True)
+        self.fc_cls = nn.Linear(256, n_anchor * 2)
+        self.fc_v = nn.Linear(256, n_anchor * 2)
+        self.fc_o = nn.Linear(256, n_anchor)
+
+    @staticmethod
+    def _build_backbone(pretrained: bool):
+        if not pretrained:
+            return torchvision.models.vgg16_bn(weights=None).features[:-1]
+        try:
+            weights_enum = getattr(torchvision.models, "VGG16_BN_Weights", None)
+            if weights_enum is not None:
+                return torchvision.models.vgg16_bn(
+                    weights=weights_enum.IMAGENET1K_V1
+                ).features[:-1]
+            return torchvision.models.vgg16_bn(pretrained=True).features[:-1]
+        except Exception as e:
+            print(f"Warning: failed to load pretrained VGG16_BN ({e}), using random init.")
+            return torchvision.models.vgg16_bn(weights=None).features[:-1]
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.slider(x)
+
+        x = x.permute(2, 3, 0, 1)
+        rows = []
+        for row_feat in x:
+            out, _ = self.bilstm(row_feat)
+            rows.append(out)
+        x = torch.stack(rows).permute(2, 0, 1, 3)
+
+        y_cls = self.fc_cls(x).reshape(*x.shape[:3], self.n_anchor, 2)
+        y_v = self.fc_v(x).reshape(*x.shape[:3], self.n_anchor, 2)
+        y_o = self.fc_o(x)
+        return y_cls, y_v, y_o
+
+
+def compute_loss(y_cls, y_v, y_o, tgt_cls, tgt_v, idx_v, tgt_o, idx_o):
+    ce = nn.CrossEntropyLoss()
+    l1 = nn.SmoothL1Loss(reduction="sum")
+
+    loss_cls = ce(y_cls.view(-1, 2), tgt_cls.view(-1))
+
+    if idx_v.any():
+        denom_v = max(int(idx_v.sum().item() // 2), 1)
+        loss_v = l1(y_v[idx_v], tgt_v[idx_v]) / denom_v
+    else:
+        loss_v = torch.zeros((), device=y_cls.device)
+
+    if idx_o.any():
+        denom_o = max(int(idx_o.sum().item()), 1)
+        loss_o = 2.0 * l1(y_o[idx_o], tgt_o[idx_o]) / denom_o
+    else:
+        loss_o = torch.zeros((), device=y_cls.device)
+
+    return loss_cls + loss_v + loss_o, loss_cls, loss_v, loss_o
+
+
+def run_epoch(model, loader, optimizer, device, train=True, max_batches=0):
+    if train:
+        model.train()
+    else:
+        model.eval()
+
+    running = 0.0
+    count = 0
+    with torch.set_grad_enabled(train):
+        for i, sample in enumerate(loader, start=1):
+            if max_batches > 0 and i > max_batches:
+                break
+            img, tgt_cls, tgt_v, idx_v, tgt_o, idx_o = [x.to(device) for x in sample]
+            y_cls, y_v, y_o = model(img)
+            loss, loss_cls, loss_v, loss_o = compute_loss(
+                y_cls, y_v, y_o, tgt_cls, tgt_v, idx_v, tgt_o, idx_o
+            )
+
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            running += float(loss.item())
+            count += 1
+            print(
+                f"[{'train' if train else 'valid'}] step={i} "
+                f"loss={loss.item():.4f} cls={loss_cls.item():.4f} "
+                f"v={loss_v.item():.4f} o={loss_o.item():.4f}"
+            )
+
+    return running / max(count, 1)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="data/dataset/mlt")
+    parser.add_argument("--checkpoint-dir", default="checkpoints_mlt")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--n-anchor", type=int, default=10)
+    parser.add_argument("--val-ratio", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--no-pretrained-backbone", action="store_true")
+    parser.add_argument("--max-train-batches", type=int, default=0)
+    parser.add_argument("--max-valid-batches", type=int, default=0)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    device = torch.device(args.device)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    dataset = CtpnDataset(args.data_dir, n_anchor=args.n_anchor)
+    val_size = max(1, int(len(dataset) * args.val_ratio))
+    train_size = len(dataset) - val_size
+    train_set, valid_set = random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+    valid_loader = DataLoader(
+        valid_set,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+
+    model = CtpnModel(
+        n_anchor=args.n_anchor, pretrained_backbone=not args.no_pretrained_backbone
+    ).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
+    print(f"dataset={len(dataset)} train={len(train_set)} valid={len(valid_set)}")
+    print(f"device={device}")
+
+    for epoch in range(1, args.epochs + 1):
+        print(f"==== epoch {epoch}/{args.epochs} ====")
+        train_loss = run_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            train=True,
+            max_batches=args.max_train_batches,
+        )
+        valid_loss = run_epoch(
+            model,
+            valid_loader,
+            optimizer,
+            device,
+            train=False,
+            max_batches=args.max_valid_batches,
+        )
+        scheduler.step()
+
+        ckpt_path = os.path.join(args.checkpoint_dir, f"ctpn_epoch_{epoch:03d}.pth")
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "train_loss": train_loss,
+                "valid_loss": valid_loss,
+            },
+            ckpt_path,
+        )
+        print(
+            f"saved={ckpt_path} train_loss={train_loss:.4f} valid_loss={valid_loss:.4f}"
+        )
+
+
+if __name__ == "__main__":
+    main()

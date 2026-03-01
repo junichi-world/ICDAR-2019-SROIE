@@ -18,30 +18,41 @@ def parse_annotation(annotation_path):
     boxes = list()
     labels = list()
 
-    f_txt = open(annotation_path)
+    with open(annotation_path, "r", encoding="utf-8", errors="ignore") as f_txt:
+        lines = [line.strip() for line in f_txt if line.strip()]
 
-    # In ICDAR case, the first line is our ROI coordinate (xmin, ymin)
-    line_txt = f_txt.readline()
-    coor = line_txt.split(',')
-    ROI_x = int(coor[0].strip('\''))
-    ROI_y = int(coor[1].strip('\''))
+    # Some legacy files have ROI on the first line with only x,y.
+    start_idx = 0
+    ROI_x = 0
+    ROI_y = 0
+    if lines:
+        first = lines[0].split(",")
+        if len(first) < 8:
+            try:
+                ROI_x = int(float(first[0].strip("'")))
+                ROI_y = int(float(first[1].strip("'")))
+                start_idx = 1
+            except (ValueError, IndexError):
+                pass
 
-    line_txt = f_txt.readline()
+    for line_txt in lines[start_idx:]:
+        coor = line_txt.split(",", maxsplit=8)
+        if len(coor) < 8:
+            continue
+        try:
+            xs = [int(float(coor[i].strip("'"))) for i in [0, 2, 4, 6]]
+            ys = [int(float(coor[i].strip("'"))) for i in [1, 3, 5, 7]]
+        except ValueError:
+            continue
 
-    while line_txt:
-        coor = line_txt.split(',')
-        #print(coor[0])
-        #print(annotation_path)
-        if coor[0] !='"\r\n':
-            xmin = int(coor[0].strip('\'')) - ROI_x
-            ymin = int(coor[1].strip('\'')) - ROI_y
-            xmax = int(coor[4].strip('\'')) - ROI_x
-            ymax = int(coor[5].strip('\'')) - ROI_y
-            # text = coor[8].strip('\n').strip('\'')
-            boxes.append([xmin, ymin, xmax, ymax])
-            labels.append(label_map['text'])
-
-        line_txt = f_txt.readline()
+        xmin = min(xs) - ROI_x
+        xmax = max(xs) - ROI_x
+        ymin = min(ys) - ROI_y
+        ymax = max(ys) - ROI_y
+        if xmax <= xmin or ymax <= ymin:
+            continue
+        boxes.append([xmin, ymin, xmax, ymax])
+        labels.append(label_map['text'])
 
     return {'boxes': boxes, 'labels': labels}
 
@@ -559,7 +570,7 @@ def photometric_distort(image):
 
     for d in distortions:
         if random.random() < 0.5:
-            if d.__name__ is 'adjust_hue':
+            if d.__name__ == 'adjust_hue':
                 # Caffe repo uses a 'hue_delta' of 18 - we divide by 255 because PyTorch needs a normalized value
                 adjust_factor = random.uniform(-18 / 255., 18 / 255.)
             else:

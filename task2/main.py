@@ -1,20 +1,30 @@
-import torch
-from torch.autograd import Variable
-import utils
-# import dataset
-from PIL import Image
+import argparse
+import csv
 import glob
 import os
-import csv
+
 import cv2
-# import models.crnn as crnn
+import torch
+from PIL import Image
+from torch.autograd import Variable
+
+import dataset
+import models.crnn as crnn
+import utils
+
+
+ALPHABET = '0123456789,.:(%$!^&-/);<~|`>?+=_[]{}"\'@#*ABCDEFGHIJKLMNOPQRSTUVWXYZ\\ '
+
+
+def _ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
 
 
 def predict_this_box(image, model, alphabet):
     converter = utils.strLabelConverter(alphabet)
     transformer = dataset.resizeNormalize((200, 32))
     image = transformer(image)
-    if torch.cuda.is_available():
+    if next(model.parameters()).is_cuda:
         image = image.cuda()
     image = image.view(1, *image.size())
     image = Variable(image)
@@ -28,104 +38,170 @@ def predict_this_box(image, model, alphabet):
     preds_size = Variable(torch.IntTensor([preds.size(0)]))
     raw_pred = converter.decode(preds.data, preds_size.data, raw=True)
     sim_pred = converter.decode(preds.data, preds_size.data, raw=False)
-    print('%-30s => %-30s' % (raw_pred, sim_pred))
+    print(f"{raw_pred:<30} => {sim_pred:<30}")
     return sim_pred
 
 
-def load_images_to_predict():
-    # load model
-    model_path = './expr/netCRNN_190_423.pth'
-    alphabet = '0123456789,.:(%$!^&-/);<~|`>?+=_[]{}"\'@#*ABCDEFGHIJKLMNOPQRSTUVWXYZ\ '
-    imgH = 32 # should be 32
-    nclass = len(alphabet) + 1
+def load_images_to_predict(model_path, force_cpu=False):
+    img_h = 32
+    nclass = len(ALPHABET) + 1
     nhiddenstate = 256
+    use_cuda = torch.cuda.is_available() and not force_cpu
+    map_location = "cuda" if use_cuda else "cpu"
 
-    model = crnn.CRNN(imgH, 1, nclass, nhiddenstate)
-    if torch.cuda.is_available():
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    model = crnn.CRNN(img_h, 1, nclass, nhiddenstate)
+    if use_cuda:
         model = model.cuda()
-    print('loading pretrained model from %s' % model_path)
-    model.load_state_dict({k.replace('module.',''):v for k,v in torch.load(model_path).items()})
 
-    # load image
-    filenames = [os.path.splitext(f)[0] for f in glob.glob("data_test/*.jpg")]
-    jpg_files = [s + ".jpg" for s in filenames]
-    for jpg in jpg_files:
-        image = Image.open(jpg).convert('L')
+    print(f"loading pretrained model from {model_path}")
+    state = torch.load(model_path, map_location=map_location)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    state = {k.replace("module.", ""): v for k, v in state.items()}
+    model.load_state_dict(state, strict=True)
+
+    _ensure_dir("test_result")
+    image_paths = sorted(glob.glob("data_test/*.jpg"))
+    if not image_paths:
+        print("No images found in data_test/*.jpg")
+        return
+
+    for jpg in image_paths:
+        stem = os.path.splitext(os.path.basename(jpg))[0]
+        bbox_path = os.path.join("boundingbox", stem + ".txt")
+        if not os.path.exists(bbox_path):
+            print(f"skip {stem}: missing {bbox_path}")
+            continue
+
+        image = Image.open(jpg).convert("L")
         words_list = []
-        with open('boundingbox/'+jpg.split('/')[1].split('.')[0]+'.txt', 'r') as boxes:
+        with open(bbox_path, "r", encoding="utf-8") as boxes:
             for line in csv.reader(boxes):
+                if len(line) < 8:
+                    continue
                 box = [int(string, 10) for string in line[0:8]]
-                boxImg = image.crop((box[0], box[1], box[4], box[5]))
-                words = predict_this_box(boxImg, model, alphabet)
+                box_img = image.crop((box[0], box[1], box[4], box[5]))
+                words = predict_this_box(box_img, model, ALPHABET)
                 words_list.append(words)
-        with open('test_result/'+jpg.split('/')[1].split('.')[0]+'.txt', 'w+') as resultfile:
+
+        out_path = os.path.join("test_result", stem + ".txt")
+        with open(out_path, "w", encoding="utf-8") as resultfile:
             for line in words_list:
-                resultfile.writelines(line+'\n')
+                resultfile.write(line + "\n")
+        print(f"wrote: {out_path}")
 
 
 def process_txt():
-    filenames = [os.path.splitext(f)[0] for f in glob.glob("test_result/*.txt")]
-    old_files = [s + ".txt" for s in filenames]
+    _ensure_dir("task2_result")
+    old_files = sorted(glob.glob("test_result/*.txt"))
+
     for old_file in old_files:
         new = []
-        with open(old_file, "r") as old:
+        with open(old_file, "r", encoding="utf-8") as old:
             for line in csv.reader(old):
-                if not line:
+                if not line or not line[0]:
                     continue
-                if not line[0]:
-                    continue
-                if line[0][0] == ' ' or line[0][-1] == ' ':
-                    line[0] = line[0].strip()
-                if ' ' in line[0]:
-                    line = line[0].split(' ')
-                new.append(line)
-        with open('task2_result/' + old_file.split('/')[1], "w+") as newfile:
-            wr = csv.writer(newfile, delimiter = '\n')
-            new = [[s[0].upper()] for s in new]
-            wr.writerows(new)
+                value = line[0].strip()
+                if " " in value:
+                    value = value.split(" ")[0]
+                new.append([value.upper()])
+
+        out_name = os.path.basename(old_file)
+        out_path = os.path.join("task2_result", out_name)
+        with open(out_path, "w", encoding="utf-8") as newfile:
+            for row in new:
+                if row:
+                    newfile.write(row[0] + "\n")
+        print(f"wrote: {out_path}")
 
 
 def for_task3():
-    filenames = [os.path.splitext(f)[0] for f in glob.glob("boundingbox/*.txt")]
-    box_files = [s + ".txt" for s in filenames]
-    for boxfile in box_files:
+    _ensure_dir("for_task3")
+    pred_files = sorted(glob.glob("test_result/*.txt"))
+    for pred_file in pred_files:
+        boxfile = os.path.join("boundingbox", os.path.basename(pred_file))
+        if not os.path.exists(boxfile):
+            print(f"skip {pred_file}: missing bbox file {boxfile}")
+            continue
         box = []
-        with open(boxfile,'r') as boxes:
+        with open(boxfile, "r", encoding="utf-8") as boxes:
             for line in csv.reader(boxes):
+                if len(line) < 8:
+                    continue
                 box.append([int(string, 10) for string in line[0:8]])
+
         words = []
-        with open('test_result/'+ boxfile.split('/')[1], 'r') as prediction:
+        with open(pred_file, "r", encoding="utf-8") as prediction:
             for line in csv.reader(prediction):
                 words.append(line)
-        words = [s if len(s)!=0 else [' '] for s in words]
-        new = []
-        for line in zip(box,words):
-            a,b = line
-            new.append(a+b)
-        with open('for_task3/'+ boxfile.split('/')[1], 'w+') as newfile:
+        words = [s if len(s) != 0 else [" "] for s in words]
+
+        out_path = os.path.join("for_task3", os.path.basename(boxfile))
+        with open(out_path, "w", encoding="utf-8", newline="") as newfile:
             csv_out = csv.writer(newfile)
-            for line in new:
-                csv_out.writerow(line)
+            for a, b in zip(box, words):
+                csv_out.writerow(a + b)
+        print(f"wrote: {out_path}")
 
 
 def draw():
-    filenames = [os.path.splitext(f)[0] for f in glob.glob("for_task3/*.txt")]
-    txt_files = [s + ".txt" for s in filenames]
+    _ensure_dir("task2_result_draw")
+    txt_files = sorted(glob.glob("for_task3/*.txt"))
     for txt in txt_files:
-        image = cv2.imread('test_original/'+ txt.split('/')[1].split('.')[0]+'.jpg', cv2.IMREAD_COLOR)
-        with open(txt, 'r') as txt_file:
+        stem = os.path.splitext(os.path.basename(txt))[0]
+        img_path = os.path.join("test_original", stem + ".jpg")
+        image = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if image is None:
+            print(f"skip {txt}: missing image {img_path}")
+            continue
+        with open(txt, "r", encoding="utf-8") as txt_file:
             for line in csv.reader(txt_file):
+                if len(line) < 8:
+                    continue
                 box = [int(string, 10) for string in line[0:8]]
-                if len(line) < 9:
-                    print(txt)
-                cv2.rectangle(image, (box[0], box[1]), (box[4], box[5]), (0,255,0), 2)
+                label = line[8].upper() if len(line) >= 9 else ""
+                cv2.rectangle(image, (box[0], box[1]), (box[4], box[5]), (0, 255, 0), 2)
                 font = cv2.FONT_HERSHEY_SIMPLEX
-                cv2.putText(image, line[8].upper(), (box[0],box[1]), font, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-        cv2.imwrite('task2_result_draw/'+ txt.split('/')[1].split('.')[0]+'.jpg', image)
+                cv2.putText(
+                    image, label, (box[0], box[1]), font, 0.5, (0, 0, 255), 1, cv2.LINE_AA
+                )
+        out_path = os.path.join("task2_result_draw", stem + ".jpg")
+        cv2.imwrite(out_path, image)
+        print(f"wrote: {out_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=["predict", "process", "for_task3", "draw", "all"],
+        default="predict",
+    )
+    parser.add_argument("--model-path", default="./expr/netCRNN_190_423.pth")
+    parser.add_argument("--cpu", action="store_true")
+    args = parser.parse_args()
+
+    try:
+        if args.mode == "predict":
+            load_images_to_predict(args.model_path, force_cpu=args.cpu)
+        elif args.mode == "process":
+            process_txt()
+        elif args.mode == "for_task3":
+            for_task3()
+        elif args.mode == "draw":
+            draw()
+        elif args.mode == "all":
+            load_images_to_predict(args.model_path, force_cpu=args.cpu)
+            process_txt()
+            for_task3()
+    except FileNotFoundError as e:
+        print(e)
+        print("Place pretrained CRNN weights at ./expr/netCRNN_190_423.pth or use --model-path.")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
-    #load_images_to_predict()
-    #process_txt()
-    # for_task3()
-    draw()
+    main()

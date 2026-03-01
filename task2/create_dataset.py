@@ -19,6 +19,10 @@ def checkImageIsValid(imageBin):
 def writeCache(env, cache):
     with env.begin(write=True) as txn:
         for k, v in cache.items():
+            if isinstance(k, str):
+                k = k.encode("utf-8")
+            if isinstance(v, str):
+                v = v.encode("utf-8")
             txn.put(k, v)
 
 

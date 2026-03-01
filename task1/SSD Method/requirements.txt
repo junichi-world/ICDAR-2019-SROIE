@@ -1,0 +1,4 @@
+torch>=2.5,<2.7
+torchvision>=0.20,<0.22
+pillow>=9,<12
+numpy>=1.24,<3

@@ -25,7 +25,7 @@ class MyDataset(data.Dataset):
             self.val_dict = {}
             self.train_dict = {}
         else:
-            data_items = list(torch.load(dict_path).items())
+            data_items = list(_torch_load_compat(dict_path).items())
             random.shuffle(data_items)
 
             self.val_dict = dict(data_items[:val_size])
@@ -34,7 +34,7 @@ class MyDataset(data.Dataset):
         if test_path is None:
             self.test_dict = {}
         else:
-            self.test_dict = torch.load(test_path)
+            self.test_dict = _torch_load_compat(test_path)
 
         self.device = device
 
@@ -46,7 +46,7 @@ class MyDataset(data.Dataset):
         return text_tensor.to(self.device)
 
     def get_train_data(self, batch_size=8):
-        samples = random.sample(self.train_dict.keys(), batch_size)
+        samples = random.sample(list(self.train_dict.keys()), batch_size)
 
         texts = [self.train_dict[k][0] for k in samples]
         labels = [self.train_dict[k][1] for k in samples]
@@ -66,7 +66,7 @@ class MyDataset(data.Dataset):
         return text_tensor.to(self.device), truth_tensor.to(self.device)
 
     def get_val_data(self, batch_size=8, device="cpu"):
-        keys = random.sample(self.val_dict.keys(), batch_size)
+        keys = random.sample(list(self.val_dict.keys()), batch_size)
 
         texts = [self.val_dict[k][0] for k in keys]
         labels = [self.val_dict[k][1] for k in keys]
@@ -104,6 +104,14 @@ def get_files(data_path="data/"):
         assert path.splitext(f1)[0] == path.splitext(f2)[0]
 
     return json_files, txt_files
+
+
+def _torch_load_compat(file_path):
+    # PyTorch >=2.6 defaults to weights_only=True; these files contain python objects.
+    try:
+        return torch.load(file_path, weights_only=False)
+    except TypeError:
+        return torch.load(file_path)
 
 
 def sort_text(txt_file):
